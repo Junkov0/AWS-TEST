@@ -1,4 +1,4 @@
-name: Deploy to EC2
+name: Deploy to Amazon ECS
 
 on:
   push:
@@ -8,14 +8,19 @@ env:
   AWS_REGION: ap-northeast-2
   ECR_REPOSITORY: june-repo
   ECR_REGISTRY: 795462797961.dkr.ecr.ap-northeast-2.amazonaws.com
+  ECS_SERVICE: june-service                 # ECS 서비스 이름
+  ECS_CLUSTER: june-cluster                 # ECS 클러스터 이름
+  ECS_TASK_DEFINITION: june-task            # ECS 작업 정의 패밀리 이름
+  CONTAINER_NAME: june-app                  # 작업 정의 내 컨테이너 이름
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # 1. AWS 로그인 (ECR 푸시 권한 획득)
+      # AWS 인증 정보 설정
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -23,33 +28,43 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 2. ECR에 이미지 빌드 및 푸시
-      - name: Build and Push to ECR
-        run: |
-          ECR_URI=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
-          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
-          docker build -t ${{ env.ECR_REPOSITORY }} .
-          docker tag ${{ env.ECR_REPOSITORY }}:latest $ECR_URI:latest
-          docker push $ECR_URI:latest
+      # Amazon ECR 로그인
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      # 3. 배스천 호스트를 경유하여 프라이빗 EC2 접속 및 배포 명령 실행
-      - name: SSH Remote Commands via Bastion
-        uses: appleboy/ssh-action@master
+      # Docker 이미지 빌드 및 ECR 푸시
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.registry }}
+          IMAGE_TAG: ${{ github.sha }} # 커밋 해시를 태그로 사용하여 버전 관리
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      # 최신 작업 정의(Task Definition) 다운로드
+      - name: Download task definition
+        run: |
+          aws ecs describe-task-definition --task-definition ${{ env.ECS_TASK_DEFINITION }} --query taskDefinition > task-definition.json
+
+      # 작업 정의 파일에 새로운 이미지 ID 주입
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
         with:
-          host: ${{ secrets.EC2_HOST }}        # 프라이빗 서버의 내부 IP
-          username: ec2-user
-          key: ${{ secrets.EC2_SSH_KEY }}
-          proxy_host: ${{ secrets.BASTION_HOST }} # 배스천의 퍼블릭 IP
-          proxy_username: ec2-user
-          proxy_key: ${{ secrets.EC2_SSH_KEY }}
-          # --- 아래는 스크립트에 전달할 환경변수 ---
-          envs: ECR_REGISTRY,ECR_REPOSITORY,AWS_REGION,ENV_CONTENT
-          script: |
-            ECR_URI=$ECR_REGISTRY/$ECR_REPOSITORY
-            echo "$ENV_CONTENT" > .env
-            docker stop my-app || true
-            docker rm my-app || true
-            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
-            docker pull $ECR_URI:latest
-            docker run -d --name my-app -p 8080:8080 --env-file .env $ECR_URI:latest
-            docker image prune -f
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      # 수정된 작업 정의를 사용하여 ECS 서비스 배포 (롤링 업데이트)
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true # 배포 완료(Healthy)까지 기다림
