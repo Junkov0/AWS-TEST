@@ -1,0 +1,55 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REPOSITORY: june-repo
+  ECR_REGISTRY: 795462797961.dkr.ecr.ap-northeast-2.amazonaws.com
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. AWS 로그인
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 2. ECR에 이미지 빌드 및 푸시
+      - name: Build and Push to ECR
+        run: |
+          ECR_URI=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+          aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+          docker build -t ${{ env.ECR_REPOSITORY }} .
+          docker tag ${{ env.ECR_REPOSITORY }}:latest $ECR_URI:latest
+          docker push $ECR_URI:latest
+
+      # 3. EC2 접속 -> .env 생성 -> 컨테이너 실행
+      - name: SSH Remote Commands
+        uses: appleboy/ssh-action@master
+        env:
+          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ENV_CONTENT: ${{ secrets.ENV_FILE_CONTENT }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: ECR_REGISTRY,ECR_REPOSITORY,AWS_REGION,ENV_CONTENT
+          script: |
+            ECR_URI=$ECR_REGISTRY/$ECR_REPOSITORY
+            echo "$ENV_CONTENT" > .env
+            docker stop my-app || true
+            docker rm my-app || true
+            aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+            docker pull $ECR_URI:latest
+            docker run -d --name my-app -p 8080:8080 --env-file .env $ECR_URI:latest
