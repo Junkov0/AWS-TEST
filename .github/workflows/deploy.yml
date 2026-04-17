@@ -35,39 +35,21 @@ jobs:
       # 3. 배스천 호스트를 경유하여 프라이빗 EC2 접속 및 배포 명령 실행
       - name: SSH Remote Commands via Bastion
         uses: appleboy/ssh-action@master
-        env:
-          ECR_REGISTRY: ${{ env.ECR_REGISTRY }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          AWS_REGION: ${{ env.AWS_REGION }}
-          ENV_CONTENT: ${{ secrets.ENV_FILE_CONTENT }}
         with:
-          # 최종 목적지 (프라이빗 서버) 정보
-          host: ${{ secrets.EC2_HOST }}        # 프라이빗 IP (예: 10.0.x.x)
+          host: ${{ secrets.EC2_HOST }}        # 프라이빗 서버의 내부 IP
           username: ec2-user
-          key: ${{ secrets.EC2_SSH_KEY }}      # 서버 접속용 .pem 키
-
-          # 징검다리 (배스천 호스트) 정보
-          proxy_host: ${{ secrets.BASTION_HOST }} # 배스천의 '퍼블릭 IP'
+          key: ${{ secrets.EC2_SSH_KEY }}
+          proxy_host: ${{ secrets.BASTION_HOST }} # 배스천의 퍼블릭 IP
           proxy_username: ec2-user
-          proxy_key: ${{ secrets.EC2_SSH_KEY }}   # 배스천 접속용 .pem 키 (서버와 동일한 경우)
-
+          proxy_key: ${{ secrets.EC2_SSH_KEY }}
+          # --- 아래는 스크립트에 전달할 환경변수 ---
           envs: ECR_REGISTRY,ECR_REPOSITORY,AWS_REGION,ENV_CONTENT
           script: |
             ECR_URI=$ECR_REGISTRY/$ECR_REPOSITORY
-            
-            # 1. 환경 변수 파일 생성
             echo "$ENV_CONTENT" > .env
-            
-            # 2. 기존 컨테이너 중지 및 삭제 (실패해도 계속 진행)
             docker stop my-app || true
             docker rm my-app || true
-            
-            # 3. ECR 로그인 및 최신 이미지 Pull
             aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
             docker pull $ECR_URI:latest
-            
-            # 4. 새 컨테이너 실행 (.env 파일 적용)
             docker run -d --name my-app -p 8080:8080 --env-file .env $ECR_URI:latest
-            
-            # 5. 사용하지 않는 오래된 이미지 정리 (용량 확보)
             docker image prune -f
